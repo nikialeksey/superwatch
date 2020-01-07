@@ -1,0 +1,28 @@
+language: c
+sudo: false
+cache:
+  directories:
+    - ~/arduino_ide
+    - ~/.arduino15/packages/
+
+before_install:
+  - source <(curl -SLs https://raw.githubusercontent.com/adafruit/travis-ci-arduino/master/install.sh)
+
+install:
+  - arduino --install-library "FastLED:3.3.2"
+  - arduino --install-library "RTClib:1.3.3"
+  - arduino --install-library "WiFi:1.2.7"
+
+script:
+  - build_platform esp32
+  - ls ./arduino_build*/esp32/superwatch/
+
+deploy:
+  provider: releases
+  skip_cleanup: true
+  api_key: $GH_TOKEN
+  file_glob: true
+  file:
+    - "arduino_build*/esp32/superwatch/superwatch.ino.bin"
+  on:
+    tags: true
