@@ -1,7 +1,11 @@
 #include <FastLED.h>
+#include <Preferences.h>
 #include <WiFi.h>
-#include "time.h"
-#include "RTClib.h"
+#include <ESPmDNS.h>
+#include <time.h>
+#include <RTClib.h>
+#include <Update.h>
+#include <WebServer.h>
 
 #include "color.h"
 #include "matrix.h"
@@ -13,18 +17,57 @@ const int NUM_LEDS = ROWS * COLUMNS;
 const int MATRIX_PIN = 18;
 const int WIFI_CONNTECT_ATTEMPTS = 20;
 
-const char* SSID = "****";
-const char* PASSWORD = "****";
-
-const char* NTP_SERVER = "pool.ntp.org";
+String NTP_SERVER = "pool.ntp.org";
 const long GMT_OFFSET_SEC = 7 * 3600; // GMT + 7
 const int DAYLIGHT_OFFSET_SEC = 3600;
 
+Preferences preferences;
+WebServer server(80);
 RTC_DS3231 rtc;
 bool rtcExists;
 CRGB leds[NUM_LEDS];
 Matrix matrix(ROWS, COLUMNS, leds);
 Watch watch;
+
+void enableNetwork(const char* ssid, const char* password) {
+  Serial.printf("Connecting to %s ..", ssid);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(ssid, password);
+  for (int i = 0; i < WIFI_CONNTECT_ATTEMPTS && WiFi.status() != WL_CONNECTED; i++) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" connected!");
+  } else {
+    Serial.printf("\nTimeout when connecting to %s. Probably ssid or password is incorrect\n", ssid);
+    Serial.println("Setup wifi access point");
+  }
+  Serial.print("Local IP: ");
+  Serial.println(WiFi.localIP());
+
+  // WiFi.disconnect(true);
+  // WiFi.mode(WIFI_OFF);
+}
+
+void setupMdns() {
+  uint64_t chipid = ESP.getEfuseMac();
+  String chipId = String((uint16_t)(chipid>>32), HEX) + String((uint32_t)chipid, HEX);
+  String name = String("superwatch-") + chipId;
+
+  if (!MDNS.begin(name.c_str())) {
+    while (1) {
+      Serial.println("Error setting up mDNS responder");
+      delay(1000);
+    } 
+  }
+
+  MDNS.setInstanceName(name);
+  Serial.println("mDNS responder started");
+  Serial.printf("I am: %s\n", name.c_str());
+  
+  MDNS.addService("http", "tcp", 80);
+}
 
 void printLocalTime() {
   struct tm timeinfo;
@@ -67,17 +110,11 @@ void IRAM_ATTR updateTimeFromRtc() {
 void IRAM_ATTR updateTimeFromNetwork() {
   //connect to WiFi
   Serial.println("Update time from network started");
-  Serial.printf("Connecting to %s ", SSID);
-  WiFi.begin(SSID, PASSWORD);
-  for (int i = 0; i < WIFI_CONNTECT_ATTEMPTS && WiFi.status() != WL_CONNECTED; i++) {
-    delay(500);
-    Serial.print(".");
-  }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" CONNECTED");
+    Serial.println("Wifi connected");
 
     //init and get the time
-    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER.c_str());
     struct tm timeinfo;
     if(!getLocalTime(&timeinfo)){
       Serial.println("Failed to obtain time");
@@ -105,7 +142,7 @@ void IRAM_ATTR updateTimeFromNetwork() {
       }
     }
   } else {
-    Serial.println(" TIMEOUT");
+    Serial.println("Wifi doesn't connected");
 
     if (rtcExists) {
       updateTimeFromRtc();
@@ -114,15 +151,20 @@ void IRAM_ATTR updateTimeFromNetwork() {
     }
   }
   
-  //disconnect WiFi as it's no longer needed
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
   Serial.println("Update time from network completed");
 }
 
 void setup() { 
   Serial.begin(115200);
-
+  
+  preferences.begin("wifi", false);
+  String ssid = preferences.getString("ssid");
+  String password = preferences.getString("password");
+  preferences.end();
+  
+  enableNetwork(ssid.c_str(), password.c_str());
+  setupMdns();
+  
   rtcExists = rtc.begin();
   if (rtcExists) {
     Serial.println("RTC has been found");
@@ -135,6 +177,55 @@ void setup() {
 
   FastLED.addLeds<NEOPIXEL, MATRIX_PIN>(leds, NUM_LEDS);
   FastLED.setBrightness(50);
+
+  preferences.begin("http", false);
+  String www_username = preferences.getString("username", "admin");
+  String www_password = preferences.getString("password", "superwatch");
+  preferences.end();
+
+  server.on("/", [www_username, www_password]() {
+    if (!server.authenticate(www_username.c_str(), www_password.c_str())) {
+      return server.requestAuthentication(
+        DIGEST_AUTH, 
+        "Login required", 
+        "Authentication failed"
+      );
+    }
+    server.send(200, "text/html", "Login OK <form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Update'></form>");
+  });
+  server.on("/update", HTTP_POST, []() {
+    server.sendHeader("Connection", "close");
+    if (Update.hasError()) {
+      server.send(200, "text/plain", "FAIL");
+    } else {
+      server.send(200, "text/plain", "Superwatch restarting...");
+      delay(10000);
+      ESP.restart();
+    }
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.setDebugOutput(true);
+      Serial.printf("Update: %s\n", upload.filename.c_str());
+      if (!Update.begin()) { //start with max available size
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) { //true to set the size to the current progress
+        Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+      Serial.setDebugOutput(false);
+    } else {
+      Serial.printf("Update Failed Unexpectedly (likely broken connection): status=%d\n", upload.status);
+    }
+  });
+  server.begin();
 }
 
 bool moveForward = true;
@@ -172,4 +263,6 @@ void loop() {
   FastLED.show();
   // insert a delay to keep the framerate modest
   FastLED.delay(1000 / 120); 
+
+  server.handleClient();
 }
